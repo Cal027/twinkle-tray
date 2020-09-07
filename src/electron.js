@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs')
-const { nativeTheme, systemPreferences, Menu, Tray, BrowserWindow, ipcMain, app, screen, globalShortcut } = require('electron')
+const { nativeTheme, systemPreferences, Menu, Tray, ipcMain, app, screen, globalShortcut } = require('electron')
+const { BrowserWindow } = require('electron-acrylic-window')
 const { exec } = require('child_process');
 const os = require("os")
 const ua = require('universal-analytics');
@@ -289,6 +290,7 @@ const defaultSettings = {
   names: {},
   analytics: !isDev,
   scrollShortcut: true,
+  useAcrylic: true,
   uuid: uuid(),
   branch: "master"
 }
@@ -362,6 +364,12 @@ function processSettings(newSettings = {}) {
 
     if (newSettings.language !== undefined) {
       getLocalization()
+    }
+
+    if (newSettings.useAcrylic !== undefined) {
+      lastTheme["UseAcrylic"] = newSettings.useAcrylic
+      handleTransparencyChange(lastTheme.EnableTransparency, newSettings.useAcrylic)
+      sendToAllWindows('theme-settings', lastTheme)
     }
 
     if (newSettings.icon !== undefined) {
@@ -770,6 +778,7 @@ function getThemeRegistry() {
             for (let value in themeSettings) {
               themeSettings[value] = themeSettings[value].value
             }
+            themeSettings["UseAcrylic"] = settings.useAcrylic
 
             // Send it off!
             sendToAllWindows('theme-settings', themeSettings)
@@ -820,6 +829,27 @@ function getAccentColors() {
     mediumDark: matchLumi(accent, 0.33).desaturate(0.1).hex(),
     dark: matchLumi(accent, 0.275).desaturate(0.1).hex(),
     transparent: matchLumi(accent, 0.275).desaturate(0.1).rgb().string()
+  }
+}
+
+// 0 = off
+// 1 = transparent
+// 2 = blur
+let currentTransparencyStyle
+function handleTransparencyChange(transparent = true, blur = false) {
+  const style = (transparent ? (blur ? 2 : 1) : 0)
+  if(style !== currentTransparencyStyle) {
+    currentTransparencyStyle = style
+  }
+  sendToAllWindows("transparencyStyle", style)
+  if(style === 2) {
+    if(settingsWindow) {
+      settingsWindow.setVibrancy("dark")
+    }
+  } else {
+    if(settingsWindow) {
+      settingsWindow.setVibrancy()
+    }
   }
 }
 
@@ -902,12 +932,16 @@ refreshDDCCI = async () => {
       for (let monitor of ddcciMonitors) {
 
         try {
+          // Get brightness current/max
+          const brightnessValues = ddcci._getVCP(monitor, 0x10)
+
           let ddcciInfo = {
             name: makeName(monitor, `${T.getString("GENERIC_DISPLAY_SINGLE")} ${local + 1}`),
             id: monitor,
             num: local,
             localID: local,
-            brightness: ddcci.getBrightness(monitor),
+            brightness: brightnessValues[0] * (100 / (brightnessValues[1] || 100)),
+            brightnessMax: (brightnessValues[1] || 100),
             brightnessRaw: -1,
             type: 'ddcci',
             min: 0,
@@ -917,11 +951,13 @@ refreshDDCCI = async () => {
 
           const hwid = monitor.split("#")
           if (monitors[hwid[2]] == undefined) {
+            // Monitor not in list
             monitors[hwid[2]] = {
               id: monitor,
               key: hwid[2],
               num: false,
               brightness: 50,
+              brightnessMax: 100,
               brightnessRaw: 50,
               type: 'none',
               min: 0,
@@ -932,8 +968,18 @@ refreshDDCCI = async () => {
               features: {}
             }
           } else {
-            if (monitors[hwid[2]].name)
+            if (monitors[hwid[2]].name) {
+              // Monitor is in list
               ddcciInfo.name = monitors[hwid[2]].name
+
+              if(monitors[hwid[2]].features === undefined) {
+                ddcciInfo.features = {
+                  powerState: (checkVCP(monitor, 0xD6) ? true : false)
+                }
+              }
+
+            }
+              
           }
 
           // Get normalization info
@@ -941,11 +987,6 @@ refreshDDCCI = async () => {
           // Unnormalize brightness
           ddcciInfo.brightnessRaw = ddcciInfo.brightness
           ddcciInfo.brightness = normalizeBrightness(ddcciInfo.brightness, true, ddcciInfo.min, ddcciInfo.max)
-
-          // DDC/CI Features
-          ddcciInfo.features = {
-            //powerState: (checkVCP(monitor, 0xD6) ? true : false)
-          }
 
           ddcciList.push(ddcciInfo)
           Object.assign(monitors[hwid[2]], ddcciInfo)
@@ -989,6 +1030,7 @@ refreshWMI = async () => {
               num: local,
               localID: local,
               brightness: monitor.CurrentBrightness,
+              brightnessMax: 100,
               brightnessRaw: -1,
               type: 'wmi',
               min: 0,
@@ -1004,6 +1046,7 @@ refreshWMI = async () => {
                 key: hwid[2],
                 num: false,
                 brightness: 50,
+                brightnessMax: 100,
                 brightnessRaw: 50,
                 type: 'none',
                 min: 0,
@@ -1043,7 +1086,7 @@ refreshWMI = async () => {
 
 function checkVCP(monitor, code) {
   try {
-    return ddcci._getVCP(monitor, code)
+    return ddcci._getVCP(monitor, code)[0]
   } catch(e) {
     return false
   }
@@ -1126,7 +1169,7 @@ function updateBrightness(index, level, useCap = true) {
   try {
     monitor.brightness = level
     if (monitor.type == "ddcci") {
-      ddcci.setBrightness(monitor.id, normalized)
+      ddcci.setBrightness(monitor.id, normalized * ((monitor.brightnessMax || 100) / 100))
     } else if (monitor.type == "wmi") {
       exec(`powershell.exe (Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightnessMethods).wmisetbrightness(0, ${normalized})"`)
     }
@@ -1385,13 +1428,14 @@ function createPanel(toggleOnLoad = false) {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show()
     repositionPanel()
-    //mainWindow.webContents.openDevTools()
+    //mainWindow.webContents.openDevTools({ mode: 'detach' })
     if (toggleOnLoad) setTimeout(() => { toggleTray(false) }, 33);
   })
 
   mainWindow.on("blur", () => {
     // Only run when not in an overlay
     if(canReposition) {
+      mainWindow.setVibrancy()
       sendToAllWindows("panelBlur")
     }
   })
@@ -1693,14 +1737,78 @@ function createSettings() {
     maximizable: true,
     resizable: true,
     minimizable: true,
+    backgroundColor: "#00000000",
     frame: false,
     icon: './src/assets/logo.ico',
-    backgroundColor: (lastTheme && lastTheme.SystemUsesLightTheme == 1 ? "#FFFFFF" : "#000000"),
+    //backgroundColor: (lastTheme && lastTheme.SystemUsesLightTheme == 1 ? "#FFFFFF" : "#000000"),
     webPreferences: {
       preload: path.join(__dirname, 'settings-preload.js'),
       devTools: settings.isDev
     }
   });
+
+  // Replace window moving behavior to fix mouse polling rate bug
+  const pollingRate = 59.997 // TO-DO: Detect the current monitor's refresh rate
+  const win = settingsWindow
+  win.on('will-move', (e) => {
+      if(!settings.useAcrylic) return false;
+      e.preventDefault()
+
+      // Track if the user is moving the window
+      if(win._moveTimeout) clearTimeout(win._moveTimeout);
+      win._moveTimeout = setTimeout(
+        () => {
+          win._isMoving = false
+          clearInterval(win._moveInterval)
+          win._moveInterval = null 
+        }, 1000/60)
+
+      // Start new behavior if not already
+      if(!win._isMoving) {
+        win._isMoving = true
+        if(win._moveInterval) return false;
+
+        // Get start positions
+        win._moveLastUpdate = 0
+        win._moveStartBounds = win.getBounds()
+        win._moveStartCursor = screen.getCursorScreenPoint()
+    
+        // Poll at 600hz while moving window
+        win._moveInterval = setInterval(() => {
+          const now = Date.now()
+          if(now >= win._moveLastUpdate + (1000/pollingRate)) {
+            win._moveLastUpdate = now
+            const cursor = screen.getCursorScreenPoint()
+    
+            // Set new position
+            win.setBounds({
+              x: win._moveStartBounds.x + (cursor.x - win._moveStartCursor.x),
+              y: win._moveStartBounds.y + (cursor.y - win._moveStartCursor.y),
+              width: win._moveStartBounds.width,
+              height: win._moveStartBounds.height
+            })
+          }
+        }, 1000/600)
+      }
+
+    })
+
+    // Replace window resizing behavior to fix mouse polling rate bug
+    win.on('will-resize', (e, newBounds) => {
+      if(!settings.useAcrylic) return false;
+      const now = Date.now()
+      if(!win._resizeLastUpdate) win._resizeLastUpdate = 0;
+        if(now >= win._resizeLastUpdate + (1000/pollingRate)) {
+          win._resizeLastUpdate = now
+          //win.setBounds(newBounds)
+        } else {
+          e.preventDefault()
+        }
+    })
+
+  
+
+
 
   settingsWindow.loadURL(
     isDev
@@ -1715,6 +1823,9 @@ function createSettings() {
     // Show after a very short delay to avoid visual bugs
     setTimeout(() => {
       settingsWindow.show()
+      if(settings.useAcrylic) {
+        settingsWindow.setVibrancy('dark')
+      }
     }, 100)
 
     // Prevent links from opening in Electron
